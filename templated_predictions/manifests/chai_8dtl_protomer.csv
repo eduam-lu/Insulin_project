@@ -1,0 +1,3 @@
+chain_id,template_cif_path,template_chain_id
+chainA,/home/x_eduam/insulin_project/templates/8DTL_templates/A_temp.cif,A
+chainB,/home/x_eduam/insulin_project/templates/8DTL_templates/B_temp.cif,A

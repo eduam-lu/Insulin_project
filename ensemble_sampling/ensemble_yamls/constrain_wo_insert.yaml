@@ -1,0 +1,25 @@
+segments:
+  - name: fn3
+    kind: rigid
+    start: 87
+    stop: 183
+    chain: B
+    orient:
+      axis: parallel
+      #translate: {x: 0, y: 0, z: 25}
+
+  - name: linker
+    kind: flexible
+    start: 182
+    stop: 197
+    chain: B
+
+  - name: tm
+    kind: rigid
+    start: 198
+    stop: 218
+    chain: B
+    orient:
+      axis: parallel
+      #translate: {x: 0, y: 0, z: 0}
+    dof: {translate: {x: 8, y: 8, z: 4}, tilt: 15, spin: 180}

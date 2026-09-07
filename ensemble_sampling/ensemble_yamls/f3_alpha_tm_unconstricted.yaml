@@ -1,0 +1,46 @@
+# Tagged construct: fn3 -- loop1 -- insert -- loop2 -- tm
+#
+# Segments must alternate rigid / flexible, and begin and end with a rigid one.
+# Numbering is PDB numbering in the input file.
+#
+# The first rigid segment is the FoldTree root: everything moves relative to
+# it, so it needs no dof block. Give dof to the segments you want to move.
+
+segments:
+  - name: fn3
+    kind: rigid
+    start: 86
+    stop: 183
+    chain: A
+
+  - name: loop1
+    kind: flexible
+    start: 184
+    stop: 194
+    chain: A
+
+  - name: insert
+    kind: rigid
+    start: 195
+    stop: 206
+    chain: A
+    dof:
+      translate: {x: 8.0, y: 8.0, z: 6.0}
+      tilt: 90.0
+      spin: 180.0
+
+  - name: loop2
+    kind: flexible
+    start: 207
+    stop: 216
+    chain: A
+
+  - name: tm
+    kind: rigid
+    start: 217
+    stop: 247
+    chain: A
+    dof:
+      translate: {x: 8.0, y: 8.0, z: 4.0}   # z omitted -> no movement along the normal
+      tilt: 15.0                      # set to 0.0 for a perpendicular-only pass
+      spin: 180.0
