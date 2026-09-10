@@ -1,7 +1,8 @@
-name: pyrosetta
+name: ensemble_sampling
 channels:
   - conda-forge
 dependencies:
+  - python=3.14
   - _openmp_mutex=4.5=20_gnu
   - alsa-lib=1.2.16.1=hb03c661_0
   - aws-c-auth=0.10.4=h4610da3_2
@@ -201,4 +202,5 @@ dependencies:
   - zstd=1.5.7=hb78ec9c_6
   - pip:
       - numpy==2.4.4
+      - --find-links https://west.rosettacommons.org/pyrosetta/quarterly/release
       - pyrosetta==2026.3+releasequarterly.5e498f1409
