@@ -1,0 +1,45 @@
+segments:
+  - name: fn3
+    kind: rigid
+    start: 91                       # <-- your F3 first residue
+    stop: 183                       # <-- your F3 last residue (defines grid origin)
+    chain: B
+    orient:
+      axis: parallel          # F3 lies flat; anchor.z ~= F3 centroid z,
+                                    # F3 has small z-extent so nothing pokes into TM
+      # no head: -- direction in xy doesn't matter for the anchor
+      # no translate: -- F3 stays at its input centroid; grid dz is measured
+      # from wherever it ends up
+
+  - name: linker
+    kind: flexible
+    start: 184                      # <-- your linker first residue
+    stop: 197                       # <-- your linker last residue
+    chain: B
+
+  - name: tm
+    kind: rigid
+    start: 198                      # <-- your TM first residue (attachment atom = its CA)
+    stop: 218                       # <-- your TM last residue
+    chain: B
+    orient:
+      axis: parallel
+      head: N                       # N-term at the +z end of the helix, so N->C
+                                    # points -z. When grid mode drops TM below
+                                    # the anchor (dz < 0), the body extends
+                                    # downward from N-term, away from F3.
+      translate:
+        z: 0.0                     # cosmetic only: centres TM ~20 A below the
+                                    # F3 anchor in the reference pose so
+                                    # report_gaps reads sensibly. Grid mode
+                                    # uses absolute placement, so this doesn't
+                                    # affect the sampled ensemble.
+    dof:
+      mode: grid
+      anchor: fn3                   # origin = CA of fn3's last residue
+      translate:
+        x: {min: -8.0, max: 8.0, step: 8.0}
+        y: {min: -8.0, max: 8.0, step: 8.0}
+        z: 15.0                    # signed; negative = below the anchor
+      tilt: 0.0
+      spin: 0.0

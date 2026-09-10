@@ -1,7 +1,7 @@
 segments:
   - name: fn3
     kind: rigid
-    start: 87
+    start: 91
     stop: 183
     chain: A
 

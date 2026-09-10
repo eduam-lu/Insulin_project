@@ -6,7 +6,7 @@ Canonically orient rigid bodies in a construct before ensemble sampling.
 Reads the same segments YAML as ensemble_sampling.py, with an added `orient:`
 block on any rigid segment whose long axis should be constrained relative to
 the membrane normal (z axis). Writes a PDB where each specified body has been
-rotated (shortest-arc, preserving N->C direction) and optionally translated.
+rotated (shortest-arc) and optionally translated.
 
 Flexible segments are left where they end up -- the resulting linker regions
 will be broken. That is deliberate: ensemble_sampling.py already closes them
@@ -16,6 +16,11 @@ YAML addition per rigid segment (any not listed is left alone):
 
     orient:
       axis: parallel        # or 'perpendicular' -- to the z axis
+      head: N               # optional; 'N' or 'C'. Named terminus ends up at
+                            # the '+' end of the chosen axis (higher z for
+                            # parallel; along the input's xy projection for
+                            # perpendicular). Absent = preserve input N->C
+                            # direction (old behaviour, sign-blind).
       translate:            # optional; each key optional
         x: 0.0              # if absent, x is not translated
         y: 0.0
@@ -174,6 +179,12 @@ def load_config(path: str):
                 f"{s['name']}: orient.axis must be 'parallel' or 'perpendicular' "
                 f"(got {axis!r})"
             )
+        head = orient.get("head")
+        if head is not None and head not in ("N", "C"):
+            raise ValueError(
+                f"{s['name']}: orient.head must be 'N' or 'C' if given "
+                f"(got {head!r})"
+            )
         translate = orient.get("translate") or {}
         bad = set(translate) - {"x", "y", "z"}
         if bad:
@@ -184,9 +195,42 @@ def load_config(path: str):
             "start": int(s["start"]),
             "stop": int(s["stop"]),
             "axis": axis,
+            "head": head,
             "translate": {k: float(v) for k, v in translate.items()},
         })
     return cfg, orientations
+
+
+# --------------------------------------------------------------------------- #
+# Target axis
+# --------------------------------------------------------------------------- #
+
+def target_axis(input_axis: np.ndarray, axis_kind: str, head) -> np.ndarray:
+    """Unit target direction for the body's N->C axis after rotation.
+
+    axis_kind='parallel'
+        head=None  -> sign of input_axis.z is preserved (old behaviour)
+        head='N'   -> N-term at +z (target = -z; N->C points down)
+        head='C'   -> C-term at +z (target = +z; N->C points up)
+
+    axis_kind='perpendicular'
+        Base direction is the input axis projected onto xy (or +x as fallback).
+        head=None  -> N->C aligns with +base (old behaviour)
+        head='N'   -> N-term at the +base end (target = -base)
+        head='C'   -> C-term at the +base end (target = +base)
+    """
+    if axis_kind == "parallel":
+        if head is None:
+            return np.array([0.0, 0.0, 1.0 if input_axis[2] >= 0 else -1.0])
+        return np.array([0.0, 0.0, -1.0 if head == "N" else 1.0])
+
+    # perpendicular
+    xy = np.array([input_axis[0], input_axis[1], 0.0])
+    n_xy = float(np.linalg.norm(xy))
+    base = np.array([1.0, 0.0, 0.0]) if n_xy < 1e-6 else xy / n_xy
+    if head is None:
+        return base
+    return -base if head == "N" else base
 
 
 # --------------------------------------------------------------------------- #
@@ -252,16 +296,7 @@ def main() -> int:
         coords = collect_ca(model, body["chain"], body["start"], body["stop"])
         input_axis, centroid, elong = long_axis_and_centroid(coords)
 
-        if body["axis"] == "parallel":
-            # Pick +z or -z, whichever is nearer -- preserves N->C direction.
-            target = np.array([0.0, 0.0, 1.0 if input_axis[2] >= 0 else -1.0])
-        else:  # perpendicular: project input axis onto xy plane
-            xy = np.array([input_axis[0], input_axis[1], 0.0])
-            if np.linalg.norm(xy) < 1e-6:
-                target = np.array([1.0, 0.0, 0.0])
-            else:
-                target = xy / np.linalg.norm(xy)
-
+        target = target_axis(input_axis, body["axis"], body["head"])
         R = shortest_arc_rotation(input_axis, target)
 
         # Rotate about the body's own centroid, so it stays put; translation
@@ -272,14 +307,18 @@ def main() -> int:
                 delta[i] = body["translate"][k] - centroid[i]
 
         angle_before = float(np.degrees(np.arccos(min(1.0, abs(input_axis[2])))))
+        head_note = ""
+        if body["head"] is not None:
+            end_desc = "+z end" if body["axis"] == "parallel" else "+xy end"
+            head_note = f", {body['head']}-term forced to {end_desc}"
         if body["axis"] == "parallel":
-            axis_desc = f"long axis {angle_before:5.1f} deg from z, now aligned"
+            axis_desc = f"long axis {angle_before:5.1f} deg from z, now aligned{head_note}"
         else:
-            axis_desc = f"long axis {angle_before:5.1f} deg from z (want 90), now in xy plane"
+            axis_desc = (f"long axis {angle_before:5.1f} deg from z (want 90), "
+                         f"now in xy plane{head_note}")
 
         c_before = [float(x) for x in centroid]
         c_after = [c_before[i] + float(delta[i]) for i in range(3)]
-        trans_note = "" if not body["translate"] else ""
         elong_note = "" if elong >= 1.5 else f"  [WARN: elongation ratio {elong:.2f}, orientation poorly defined]"
 
         print(f"  {body['name']} ({body['chain']}/{body['start']}-{body['stop']}):")
@@ -289,6 +328,38 @@ def main() -> int:
 
         transform_body(model, body["chain"], body["start"], body["stop"],
                        R, delta, centroid)
+
+        # Confirm the head/tail landed where requested. This is the line that
+        # would have caught the F3-TM overlap bug: if `head` is set and the
+        # terminus is not on the correct side of the centroid along the axis,
+        # something is off (usually a degenerate or nearly-degenerate PCA).
+        n_ca = model[body["chain"]][body["start"]]["CA"].get_coord()
+        c_ca = model[body["chain"]][body["stop"]]["CA"].get_coord()
+        if body["axis"] == "parallel":
+            print(f"    after: N-term CA z={float(n_ca[2]):+7.2f}, "
+                  f"C-term CA z={float(c_ca[2]):+7.2f}")
+        else:
+            # Project each terminus onto the target xy direction and report
+            # the signed offset from the centroid.
+            n_off = float(np.dot(np.asarray(n_ca) - np.asarray(c_after), target))
+            c_off = float(np.dot(np.asarray(c_ca) - np.asarray(c_after), target))
+            print(f"    after: N-term along +axis={n_off:+7.2f}, "
+                  f"C-term along +axis={c_off:+7.2f}")
+
+        if body["head"] is not None:
+            # Sanity check on the request
+            if body["axis"] == "parallel":
+                ok = (float(n_ca[2]) > float(c_ca[2])) if body["head"] == "N" \
+                    else (float(c_ca[2]) > float(n_ca[2]))
+            else:
+                n_off = float(np.dot(np.asarray(n_ca) - np.asarray(c_after), target))
+                c_off = float(np.dot(np.asarray(c_ca) - np.asarray(c_after), target))
+                ok = (n_off > c_off) if body["head"] == "N" else (c_off > n_off)
+            if not ok:
+                print(f"    WARN: {body['head']}-term did not end up on the "
+                      "requested end. Check the elongation ratio above; a "
+                      "poorly-defined long axis can make head enforcement "
+                      "unreliable.")
 
     report_gaps(model, cfg)
 

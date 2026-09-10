@@ -10,7 +10,7 @@ segments:
 
   - name: linker
     kind: flexible
-    start: 182
+    start: 184
     stop: 197
     chain: B
 
