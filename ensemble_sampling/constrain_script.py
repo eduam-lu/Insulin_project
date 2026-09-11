@@ -21,10 +21,24 @@ YAML addition per rigid segment (any not listed is left alone):
                             # parallel; along the input's xy projection for
                             # perpendicular). Absent = preserve input N->C
                             # direction (old behaviour, sign-blind).
-      translate:            # optional; each key optional
-        x: 0.0              # if absent, x is not translated
-        y: 0.0
-        z: 0.0
+      tilt: 15.0            # optional; degrees the long axis deviates from
+                            # the target axis after alignment. 0 = exactly on
+                            # axis.
+      tilt_azimuth: 0.0     # optional; degrees, which way the body leans.
+                            # parallel:      0 -> N->C tips toward +x,
+                            #               90 -> toward +y.
+                            # perpendicular: 0 -> N->C tips toward +z (out of
+                            #                     the membrane plane),
+                            #               90 -> leans within the plane.
+      translate:            # optional; each key optional. RELATIVE shift in A
+        x: 0.0              # from the body's input position; absent = no
+        y: 0.0              # shift on that axis. (x: 10 moves +10 A, it does
+        z: 0.0              # not move the centroid *to* x = 10.)
+
+Order of operations per body: align to the target axis, apply tilt, apply the
+relative translation. Because both rotations are taken about the body's own
+input centroid, that ordering is equivalent to any other -- the result is a
+single rotation plus a single displacement.
 
 Input and output can be either PDB or mmCIF; the format is inferred from the
 file extension (.pdb / .ent -> PDB; .cif / .mmcif -> mmCIF).
@@ -124,6 +138,52 @@ def shortest_arc_rotation(v_from: np.ndarray, v_to: np.ndarray) -> np.ndarray:
     return np.eye(3) + s * K + (1.0 - c) * (K @ K)
 
 
+def rodrigues(axis: np.ndarray, degrees: float) -> np.ndarray:
+    """Rotation matrix of `degrees` about `axis` (right-handed)."""
+    axis = axis / np.linalg.norm(axis)
+    t = np.radians(degrees)
+    K = np.array([[0.0, -axis[2], axis[1]],
+                  [axis[2], 0.0, -axis[0]],
+                  [-axis[1], axis[0], 0.0]])
+    return np.eye(3) + np.sin(t) * K + (1.0 - np.cos(t)) * (K @ K)
+
+
+def tilt_rotation(target: np.ndarray, axis_kind: str,
+                  tilt_deg: float, azimuth_deg: float) -> np.ndarray:
+    """Rotation tipping `target` by `tilt_deg` toward the azimuth direction.
+
+    Azimuth frames, both measured as a rotation from `u` toward `w`:
+
+    'parallel'      target is +-z, so the frame is the lab xy plane and does
+                    not depend on `head`: u = +x, w = +y. Azimuth 0 leans the
+                    N->C direction toward +x, 90 toward +y.
+    'perpendicular' target lies in xy, so the frame is built on the body:
+                    u = +z, w = target x z. Azimuth 0 leans out of the
+                    membrane plane toward +z, 90 leans within the plane, to
+                    the body's right seen from +z.
+    """
+    if abs(tilt_deg) < 1e-9:
+        return np.eye(3)
+    target = target / np.linalg.norm(target)
+
+    if axis_kind == "parallel":
+        # Lab frame, deliberately not derived from target: otherwise head: N
+        # (target = -z) would mirror the handedness of the azimuth.
+        u = np.array([1.0, 0.0, 0.0])
+        w = np.array([0.0, 1.0, 0.0])
+    else:
+        ref = np.array([0.0, 0.0, 1.0])
+        u = ref - float(np.dot(ref, target)) * target
+        if np.linalg.norm(u) < 1e-6:  # target happened to be parallel to ref
+            ref = np.array([0.0, 1.0, 0.0])
+            u = ref - float(np.dot(ref, target)) * target
+        u /= np.linalg.norm(u)
+        w = np.cross(target, u)
+    az = np.radians(azimuth_deg)
+    lean = np.cos(az) * u + np.sin(az) * w
+    return rodrigues(np.cross(target, lean), tilt_deg)
+
+
 # --------------------------------------------------------------------------- #
 # Residue selection & transform
 # --------------------------------------------------------------------------- #
@@ -185,6 +245,16 @@ def load_config(path: str):
                 f"{s['name']}: orient.head must be 'N' or 'C' if given "
                 f"(got {head!r})"
             )
+        unknown = set(orient) - {"axis", "head", "tilt", "tilt_azimuth",
+                                 "translate"}
+        if unknown:
+            raise ValueError(f"{s['name']}: unknown orient keys {sorted(unknown)}")
+        tilt = float(orient.get("tilt") or 0.0)
+        if not -90.0 <= tilt <= 90.0:
+            raise ValueError(
+                f"{s['name']}: orient.tilt must be within +/-90 deg "
+                f"(got {tilt}); use head: to flip the body instead")
+        azimuth = float(orient.get("tilt_azimuth") or 0.0)
         translate = orient.get("translate") or {}
         bad = set(translate) - {"x", "y", "z"}
         if bad:
@@ -196,6 +266,8 @@ def load_config(path: str):
             "stop": int(s["stop"]),
             "axis": axis,
             "head": head,
+            "tilt": tilt,
+            "tilt_azimuth": azimuth,
             "translate": {k: float(v) for k, v in translate.items()},
         })
     return cfg, orientations
@@ -297,25 +369,34 @@ def main() -> int:
         input_axis, centroid, elong = long_axis_and_centroid(coords)
 
         target = target_axis(input_axis, body["axis"], body["head"])
-        R = shortest_arc_rotation(input_axis, target)
+        R_align = shortest_arc_rotation(input_axis, target)
+        R_tilt = tilt_rotation(target, body["axis"],
+                               body["tilt"], body["tilt_azimuth"])
+        R = R_tilt @ R_align
+        final_axis = R @ input_axis
 
-        # Rotate about the body's own centroid, so it stays put; translation
-        # (if any) is applied on top.
+        # Both rotations are about the body's own centroid, so it stays put;
+        # the translation is a relative shift applied on top.
         delta = np.zeros(3)
         for i, k in enumerate("xyz"):
             if k in body["translate"]:
-                delta[i] = body["translate"][k] - centroid[i]
+                delta[i] = body["translate"][k]
 
         angle_before = float(np.degrees(np.arccos(min(1.0, abs(input_axis[2])))))
         head_note = ""
         if body["head"] is not None:
             end_desc = "+z end" if body["axis"] == "parallel" else "+xy end"
             head_note = f", {body['head']}-term forced to {end_desc}"
+        tilt_note = ""
+        if abs(body["tilt"]) > 1e-9:
+            tilt_note = (f", then tilted {body['tilt']:.1f} deg "
+                         f"(azimuth {body['tilt_azimuth']:.1f})")
         if body["axis"] == "parallel":
-            axis_desc = f"long axis {angle_before:5.1f} deg from z, now aligned{head_note}"
+            axis_desc = (f"long axis {angle_before:5.1f} deg from z, "
+                         f"now aligned{head_note}{tilt_note}")
         else:
             axis_desc = (f"long axis {angle_before:5.1f} deg from z (want 90), "
-                         f"now in xy plane{head_note}")
+                         f"now in xy plane{head_note}{tilt_note}")
 
         c_before = [float(x) for x in centroid]
         c_after = [c_before[i] + float(delta[i]) for i in range(3)]
@@ -328,6 +409,18 @@ def main() -> int:
 
         transform_body(model, body["chain"], body["start"], body["stop"],
                        R, delta, centroid)
+
+        # Deviation from the requested target axis is exactly |tilt|, whatever
+        # the azimuth, so this line catches any sign or frame mistake in the
+        # tilt. The angle from z is reported too since that is the physically
+        # meaningful one for a membrane body.
+        from_target = float(np.degrees(np.arccos(
+            min(1.0, abs(float(np.dot(final_axis, target)))))))
+        from_z = float(np.degrees(np.arccos(
+            min(1.0, abs(float(final_axis[2]))))))
+        print(f"    after: {from_target:5.1f} deg off target axis "
+              f"(requested {abs(body['tilt']):5.1f}), "
+              f"{from_z:5.1f} deg from z")
 
         # Confirm the head/tail landed where requested. This is the line that
         # would have caught the F3-TM overlap bug: if `head` is set and the
