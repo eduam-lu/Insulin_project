@@ -27,13 +27,21 @@ Stages
              Translations are lab-frame deltas from the input pose.
      grid    Iterate the Cartesian product of the declared grid axes; run
              every cell once and record non-viable cells with zero
-             trajectories. Translations are absolute positions of the moved
-             segment's N-terminal CA, expressed relative to the C-terminal CA
-             of an `anchor` rigid segment (signed z: negative = below anchor).
+             trajectories. Translations are lab-frame displacements from the
+             input pose (signed; z: 0 = in place, z: negative = moved down).
+             An `anchor` may be named; it is recorded as metadata only.
 4. For each placement, run Monte Carlo torsion sampling over the flexible
    segments (perturb -> close -> repack -> Metropolis), analogous to the
    SetTorsion + PackRotamers + GenericMonteCarlo block in symm_torsions.xml.
 5. Filter surviving configurations (PLACEHOLDER - criteria not yet decided).
+
+Parallelism (grid mode only)
+----------------------------
+--cores N runs grid cells in N worker processes, one cell per task. Each cell
+is seeded from (--seed, cell index) and writes its own silent file under
+<out>/parts/; the parent merges them into --silent-name (single header) and
+writes metrics.json in placement order. Output does not depend on N.
+Random mode stays serial with one shared RNG, as before.
 
 Convention assumed throughout: the membrane normal is the lab-frame z axis and
 the bilayer mid-plane is at z = 0. If your input PDB is not oriented that way
@@ -42,6 +50,9 @@ set MEMBRANE_NORMAL below to the correct vector.
 
     python sample_linker_ensemble.py --pdb tagged.pdb --config tagged.yaml \
         --n-placements 50 --n-traj 20 --trials 500 --out ensemble/
+
+    python sample_linker_ensemble.py --pdb tagged.pdb --config grid.yaml \
+        --n-traj 20 --trials 500 --cores 16 --out grid_ensemble/
 
 Example YAML
 ------
@@ -95,8 +106,10 @@ import argparse
 import itertools
 import json
 import math
+import multiprocessing
 import random
-import time
+import shutil
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -143,10 +156,10 @@ class DOF:
     Grid mode: any of {x, y, z, tilt, spin} may be given as a scalar (fixed
     value) or as a dict {min, max, step} (grid axis). The Cartesian product
     of the grid axes is enumerated, with scalars held constant. The (x, y, z)
-    values are absolute positions of the moved segment's N-terminal CA,
-    expressed relative to the C-terminal CA of `anchor` -- signed, so
-    z: -15 means "attachment atom 15 A below the anchor". Tilt and spin
-    keep their perturbation-from-input semantics.
+    values are lab-frame displacements of the segment from the input pose --
+    signed, so z: 0 leaves it in place and z: -15 moves it 15 A down. Tilt
+    and spin keep their perturbation-from-input semantics. `anchor`, if given,
+    is recorded as metadata only (grid-frame origin in metrics.json).
     """
     mode: str = "random"
     anchor: Optional[str] = None
@@ -549,10 +562,9 @@ def _axis_values(mn: float, mx: float, step: float) -> List[float]:
 def anchor_position(pose, cfg: Construct, anchor_name: str):
     """CA of the C-terminal residue of the named rigid segment.
 
-    This is the origin of the grid coordinate frame for any mobile segment
-    that names it as `anchor`: (dx, dy, dz) = (0, 0, 0) means "attachment CA
-    sits exactly at this atom", and z is a signed lab-frame offset from it
-    (negative -> below, in the F3/TM case that means towards the membrane).
+    Recorded in metrics.json as the grid-frame origin for any mobile segment
+    that names it as `anchor`. It is metadata only: translations are lab-frame
+    displacements from the input pose and do not reference this point.
     """
     for s in cfg.rigid:
         if s.name == anchor_name:
@@ -596,7 +608,7 @@ def enumerate_grid_placements(mobiles: List[Segment]):
     fixed. Iteration order is a Cartesian product across all axes of all
     mobile segments, in declaration order (last axis varies fastest).
 
-    For grid segments (dx, dy, dz) are absolute coords (see apply_placement).
+    For grid segments (dx, dy, dz) are displacements (see apply_placement).
     Tilt/spin keep their perturbation semantics. `tilt_azimuth` is deterministic
     at 0.0 in grid mode -- if you later grid tilt itself, decide whether to
     also grid the azimuth or just pick a fixed direction and record that here.
@@ -633,11 +645,10 @@ def apply_placement(pose, cfg: Construct, jumps: Dict[str, int],
     """Apply a placement to the mobile rigid segments, in place.
 
     Order per segment: spin (about own axis) -> tilt (about a perpendicular)
-    -> translate. Random-mode translations are lab-frame deltas from the
-    input pose. Grid-mode translations move the segment's N-terminal CA to
-    an absolute target: anchor_position + (dx, dy, dz), where dz is signed.
-    Because tilt/spin rotate the attachment CA off its input location, the
-    translation for grid mode is measured *after* the rotations are applied.
+    -> translate. In both modes translations are lab-frame deltas from the
+    input pose: (dx, dy, dz) displace the segment as-is, so dz=0 leaves it
+    where it was. Grid mode's `anchor` is kept only as recorded metadata
+    (the grid-frame origin in metrics.json) and does not enter the move.
     """
     block_of = {r.name: (lo, hi) for r, lo, hi in cfg.blocks()}
 
@@ -655,14 +666,11 @@ def apply_placement(pose, cfg: Construct, jumps: Dict[str, int],
             tilt_axis = perpendicular_to(own_axis, params.get("tilt_azimuth", 0.0))
             rotate_jump(pose, jid, tilt_axis, params["tilt"], centre)
 
-        if seg.dof.mode == "grid":
-            ap = anchor_positions[seg.dof.anchor]
-            current = ca_xyz(pose, seg.start)
-            tx = ap.x + params["dx"] - current.x
-            ty = ap.y + params["dy"] - current.y
-            tz = ap.z + params["dz"] - current.z
-        else:
-            tx, ty, tz = params["dx"], params["dy"], params["dz"]
+        # Both modes treat (dx, dy, dz) as lab-frame displacements from the
+        # input pose: dz=0 leaves the segment where it is. Grid mode's anchor
+        # is retained only as recorded metadata (grid-frame origin in
+        # metrics.json); it no longer enters the translation.
+        tx, ty, tz = params["dx"], params["dy"], params["dz"]
 
         dist = math.sqrt(tx * tx + ty * ty + tz * tz)
         if dist > 1e-9:
@@ -965,6 +973,271 @@ class SilentWriter:
 
 
 # --------------------------------------------------------------------------- #
+# Run context and per-placement work (shared by serial and parallel paths)
+# --------------------------------------------------------------------------- #
+
+# Per-cell silent files live here until they are merged into --silent-name.
+PARTS_DIRNAME = "parts"
+
+
+def init_rosetta(seed: int) -> None:
+    pyrosetta.init(
+        f"-ex1 -ex2aro -use_input_sc -mute all -constant_seed -jran {seed or 1}"
+    )
+
+
+@dataclass
+class RunContext:
+    """Everything a placement needs that is built once per process.
+
+    PyRosetta objects (poses, score functions, movers) cannot be pickled, so
+    the parent never ships this to a worker: each worker builds its own copy
+    from the same `args` in its pool initializer.
+    """
+    args: argparse.Namespace
+    outdir: Path
+    reference: object
+    cfg: Construct
+    jumps: Dict[str, int]
+    sfxn: object
+    closers: list
+    packer: object
+    mobiles: List[Segment]
+    placement_mode: str
+    anchor_positions: Dict[str, object]
+    burnin: int
+
+
+def build_context(args: argparse.Namespace) -> RunContext:
+    """Load the input, build fold tree / score function / movers. No output."""
+    reference = pyrosetta.pose_from_pdb(args.pdb)
+    cfg = to_pose_numbering(reference, load_construct(args.config))
+    jumps = build_fold_tree(reference, cfg)
+    loops = build_loops(cfg)
+
+    sfxn = make_score_function(args.chainbreak_weight)
+    movemap = make_loop_movemap(cfg)
+    closers = make_closure_movers(loops, movemap)
+    packer = make_repack_mover(sfxn, cfg)
+
+    mobiles = [s for s in cfg.rigid if s.dof.is_mobile]
+    placement_mode = mobiles[0].dof.mode if mobiles else "random"
+
+    # Anchors are required to be non-mobile (checked in Construct.validate),
+    # so their C-terminal CA is unchanged by any placement and can be
+    # measured once from the reference pose.
+    anchor_positions: Dict[str, object] = {}
+    if placement_mode == "grid":
+        for s in mobiles:
+            if s.dof.anchor and s.dof.anchor not in anchor_positions:
+                anchor_positions[s.dof.anchor] = anchor_position(
+                    reference, cfg, s.dof.anchor)
+
+    burnin = (args.burnin if args.burnin is not None
+              else (args.trials // 5 if args.boltzmann_n else 0))
+
+    return RunContext(args=args, outdir=Path(args.out), reference=reference,
+                      cfg=cfg, jumps=jumps, sfxn=sfxn, closers=closers,
+                      packer=packer, mobiles=mobiles,
+                      placement_mode=placement_mode,
+                      anchor_positions=anchor_positions, burnin=burnin)
+
+
+def make_placement_record(args, p_idx: int, spec: Dict[str, Dict[str, float]],
+                          viable: bool, gap_note: str = "",
+                          n_traj_run: Optional[int] = None,
+                          extra: Optional[dict] = None) -> dict:
+    if n_traj_run is None:
+        n_traj_run = args.n_traj if viable else 0
+    prec = {"placement": p_idx, "viable": bool(viable), "n_traj_run": n_traj_run}
+    for name, params in spec.items():
+        prec.update({f"{name}_{k}": round(float(v), 3)
+                     for k, v in params.items()})
+    if gap_note:
+        prec["gap_note"] = gap_note
+    if extra:
+        prec.update(extra)
+    return prec
+
+
+def run_trajectories(ctx: RunContext, placed, p_idx: int,
+                     spec: Dict[str, Dict[str, float]], rng: random.Random,
+                     writer: Optional[SilentWriter]) -> Tuple[List[dict], int]:
+    """Run n_traj MC trajectories on `placed`; write kept structures.
+
+    Returns (model records, number of structures kept). Records are returned
+    rather than appended to shared state so this works inside a worker.
+    """
+    args = ctx.args
+    records: List[dict] = []
+    n_kept = 0
+    for t_idx in range(args.n_traj):
+        start = placed.clone()
+        for s_idx, pose in enumerate(mc_torsion_sampling(
+                start, ctx.cfg, ctx.sfxn, ctx.closers, ctx.packer, rng,
+                trials=args.trials,
+                temperature=args.temperature,
+                sigma=args.sigma,
+                n_perturb=args.n_perturb,
+                boltzmann_n=args.boltzmann_n,
+                burnin=ctx.burnin)):
+            keep, m = passes_filters(pose, ctx.cfg, ctx.sfxn)
+            tag = (f"model_{p_idx:03d}_{t_idx:03d}_{s_idx:04d}"
+                   if args.boltzmann_n else f"model_{p_idx:03d}_{t_idx:03d}")
+
+            rec = {"tag": tag, "placement": p_idx, "traj": t_idx,
+                   "snapshot": s_idx, "kept": keep, **m}
+            for name, params in spec.items():
+                rec.update({f"{name}_{k}": round(float(v), 3)
+                            for k, v in params.items()})
+            records.append(rec)
+
+            if keep:
+                if writer is not None:
+                    # Everything numeric in the record becomes a SCORE:
+                    # column, so metrics and placement DOF live inside the
+                    # silent file alongside the coordinates.
+                    energies = {k: float(v) for k, v in rec.items()
+                                if k != "tag" and isinstance(v, (int, float, bool))}
+                    writer.add(pose, tag, energies)
+                else:
+                    pose.dump_pdb(str(ctx.outdir / f"{tag}.pdb"))
+                n_kept += 1
+    return records, n_kept
+
+
+# --------------------------------------------------------------------------- #
+# Grid mode: one task per cell, optionally across worker processes
+# --------------------------------------------------------------------------- #
+
+def cell_seed(seed: int, p_idx: int) -> int:
+    """Deterministic per-cell seed in [1, 2**31 - 2].
+
+    Hashing (seed, p_idx) rather than e.g. seed + p_idx keeps neighbouring
+    cells from getting related streams. Because the seed depends only on the
+    cell, a cell's structures are the same whichever worker runs it and in
+    whatever order - so --cores 1 and --cores 36 give the same ensemble.
+    (str seeds go through SHA-512 in `random`, so PYTHONHASHSEED is irrelevant.)
+    """
+    return random.Random(f"{seed}:{p_idx}").randrange(1, 2**31 - 1)
+
+
+_ROSETTA_RESEED_WARNED = False
+
+
+def reseed_rosetta(seed: int) -> None:
+    """Reseed Rosetta's global RNG (used by the packer and MonteCarlo).
+
+    Without this, each worker's Rosetta stream would depend on which cells it
+    happened to run before, breaking core-count independence.
+    """
+    global _ROSETTA_RESEED_WARNED
+    try:
+        pyrosetta.rosetta.numeric.random.rg().set_seed(seed)
+    except AttributeError as exc:
+        if not _ROSETTA_RESEED_WARNED:
+            print(f"WARNING: could not reseed Rosetta's RNG ({exc}). Grid "
+                  "results will depend on --cores and scheduling.", flush=True)
+            _ROSETTA_RESEED_WARNED = True
+
+
+def run_grid_cell(ctx: RunContext, p_idx: int, spec: Dict[str, Dict[str, float]],
+                  verify_silent: bool) -> dict:
+    """Run one viable grid cell into its own silent file (or PDBs)."""
+    args = ctx.args
+    seed = cell_seed(args.seed, p_idx)
+    rng = random.Random(seed)
+    reseed_rosetta(seed)
+
+    part_path = None
+    writer = None
+    if args.silent:
+        part_path = ctx.outdir / PARTS_DIRNAME / f"p{p_idx:05d}.out"
+        if part_path.exists():          # never append to a stale part
+            part_path.unlink()
+        writer = SilentWriter(part_path, ctx.sfxn, verify=verify_silent)
+
+    placed = ctx.reference.clone()
+    apply_placement(placed, ctx.cfg, ctx.jumps, spec, ctx.anchor_positions)
+    records, n_kept = run_trajectories(ctx, placed, p_idx, spec, rng, writer)
+
+    # SilentWriter only creates the file on the first add(), so a cell that
+    # kept nothing has no part file.
+    return {"p_idx": p_idx, "records": records, "n_kept": n_kept,
+            "part": str(part_path) if (part_path is not None and n_kept) else None,
+            "error": None}
+
+
+def _safe_run_cell(ctx: RunContext, task) -> dict:
+    """Wrap run_grid_cell so one failing cell doesn't take down the run.
+
+    A failed cell's records are discarded and its part file (possibly
+    partial) is not merged, so the silent file never holds structures that
+    metrics.json doesn't know about.
+    """
+    p_idx, spec, verify = task
+    try:
+        return run_grid_cell(ctx, p_idx, spec, verify)
+    except Exception:                                              # noqa: BLE001
+        return {"p_idx": p_idx, "records": [], "n_kept": 0, "part": None,
+                "error": traceback.format_exc()}
+
+
+_WORKER_CTX: Optional[RunContext] = None
+
+
+def _worker_init(args: argparse.Namespace) -> None:
+    global _WORKER_CTX
+    init_rosetta(args.seed)
+    _WORKER_CTX = build_context(args)
+
+
+def _worker_run_cell(task) -> dict:
+    return _safe_run_cell(_WORKER_CTX, task)
+
+
+def merge_silent_parts(parts: List[Path], dest: Path) -> Tuple[int, bool]:
+    """Concatenate per-cell silent files into `dest` with a single header.
+
+    Each part was written as a fresh file, so each starts with its own header
+    (SEQUENCE:, the SCORE: column-name line, any REMARK lines). The first part
+    is copied verbatim; for the rest, everything before their first *data*
+    SCORE: line (the second SCORE: line) is dropped. Plain `cat` would leave
+    repeated column-name lines, which parse_score_table() in the analysis
+    scripts would read as data rows.
+
+    Written to a .tmp file and renamed, so an interrupted merge never leaves a
+    half-written ensemble.out. Returns (structures written, headers consistent).
+    """
+    n_structs = 0
+    header_cols: Optional[List[str]] = None
+    consistent = True
+    tmp = dest.with_name(dest.name + ".tmp")
+    with open(tmp, "w") as out:
+        for i, part in enumerate(parts):
+            n_score = 0
+            with open(part) as fh:
+                for line in fh:
+                    if line.startswith("SCORE:"):
+                        n_score += 1
+                        if n_score == 1:
+                            cols = line.split()
+                            if header_cols is None:
+                                header_cols = cols
+                            elif cols != header_cols:
+                                consistent = False
+                        else:
+                            n_structs += 1
+                    if i > 0 and n_score < 2:
+                        continue
+                    if not line.endswith("\n"):
+                        line += "\n"
+                    out.write(line)
+    tmp.replace(dest)
+    return n_structs, consistent
+
+
+# --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
 
@@ -1009,27 +1282,34 @@ def parse_args():
     p.add_argument("--silent-name", default="ensemble.out",
                    help="Silent file name, inside --out")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--cores", type=int, default=1,
+                   help="Grid mode only: worker processes, one grid cell per "
+                        "task. Each worker loads its own PyRosetta, so budget "
+                        "memory per core. Results do not depend on this value.")
+    p.add_argument("--keep-parts", action="store_true",
+                   help="Grid mode: keep the per-cell silent files in "
+                        f"<out>/{PARTS_DIRNAME}/ after a successful merge")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    rng = random.Random(args.seed)
+    if args.cores < 1:
+        raise SystemExit("--cores must be >= 1")
+    rng = random.Random(args.seed)     # random mode only; grid seeds per cell
 
-    pyrosetta.init(
-        f"-ex1 -ex2aro -use_input_sc -mute all -constant_seed -jran {args.seed or 1}"
-    )
-    # Time measurement start
-    start_time = time.perf_counter()
+    init_rosetta(args.seed)
 
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    reference = pyrosetta.pose_from_pdb(args.pdb)
-    cfg = to_pose_numbering(reference, load_construct(args.config))
+    ctx = build_context(args)
+    reference, cfg, jumps = ctx.reference, ctx.cfg, ctx.jumps
+    mobiles, placement_mode = ctx.mobiles, ctx.placement_mode
+    anchor_positions, burnin = ctx.anchor_positions, ctx.burnin
 
-    jumps = build_fold_tree(reference, cfg)
-    loops = build_loops(cfg)
+    if placement_mode != "grid" and args.cores > 1:
+        raise SystemExit("--cores > 1 is only supported in grid mode.")
 
     print("Rigid    : " + ", ".join(
         f"{s.name} {s.start}-{s.stop}"
@@ -1044,8 +1324,6 @@ def main():
               f"gap in input {loop_gap(reference, s):.1f} A")
     print(reference.fold_tree())
 
-    burnin = (args.burnin if args.burnin is not None
-              else (args.trials // 5 if args.boltzmann_n else 0))
     if args.boltzmann_n:
         print(f"Sampling : Boltzmann snapshots every {args.boltzmann_n} accepted "
               f"moves, after {burnin} burn-in trials (T = {args.temperature})")
@@ -1054,38 +1332,31 @@ def main():
     else:
         print("Sampling : lowest-energy structure per trajectory (recover_low)")
 
-    sfxn = make_score_function(args.chainbreak_weight)
-    movemap = make_loop_movemap(cfg)
-    closers = make_closure_movers(loops, movemap)
-    packer = make_repack_mover(sfxn, cfg)
-
     silent_path = outdir / args.silent_name
+    parts_dir = outdir / PARTS_DIRNAME
+    writer = None
     if args.silent:
         if silent_path.exists():
             raise SystemExit(
                 f"{silent_path} already exists. Silent files are appended to, so "
                 "a rerun would mix old and new structures - move or delete it first."
             )
-        writer = SilentWriter(silent_path, sfxn)
-        print(f"Output   : silent file {silent_path}")
+        if placement_mode == "grid":
+            if parts_dir.exists() and any(parts_dir.iterdir()):
+                raise SystemExit(
+                    f"{parts_dir} is not empty (left over from an earlier run?) "
+                    "- move or delete it first.")
+            parts_dir.mkdir(exist_ok=True)
+            print(f"Output   : silent file {silent_path} "
+                  f"(per-cell parts in {parts_dir}/, merged at the end)")
+        else:
+            writer = SilentWriter(silent_path, ctx.sfxn)
+            print(f"Output   : silent file {silent_path}")
     else:
-        writer = None
         print(f"Output   : one PDB per model in {outdir}/")
 
     # ----- Placement setup -----------------------------------------------
-    mobiles = [s for s in cfg.rigid if s.dof.is_mobile]
-    placement_mode = mobiles[0].dof.mode if mobiles else "random"
-
-    # Anchors are required to be non-mobile (checked in Construct.validate),
-    # so their C-terminal CA is unchanged by any placement and can be
-    # measured once from the reference pose.
-    anchor_positions: Dict[str, object] = {}
     if placement_mode == "grid":
-        for s in mobiles:
-            if s.dof.anchor and s.dof.anchor not in anchor_positions:
-                anchor_positions[s.dof.anchor] = anchor_position(
-                    reference, cfg, s.dof.anchor)
-
         grid_placements = list(enumerate_grid_placements(mobiles))
         print(f"Placement: grid, {len(grid_placements)} cells")
         for s in mobiles:
@@ -1099,73 +1370,24 @@ def main():
                     ("x", s.dof.tx), ("y", s.dof.ty), ("z", s.dof.tz),
                     ("tilt", s.dof.tilt), ("spin", s.dof.spin)]
                 if k not in s.dof.grid_axes)
-            anchor_seg = next(x for x in cfg.rigid if x.name == s.dof.anchor)
-            ap = anchor_positions[s.dof.anchor]
             print(f"           {s.name}: axes {axes_desc}")
             if fixed_desc:
                 print(f"           {s.name}: fixed {fixed_desc}")
-            print(f"           {s.name}: anchor {s.dof.anchor} "
-                  f"(CA of res {anchor_seg.stop} at "
-                  f"{ap.x:.2f}, {ap.y:.2f}, {ap.z:.2f})")
+            if s.dof.anchor:
+                anchor_seg = next(x for x in cfg.rigid if x.name == s.dof.anchor)
+                ap = anchor_positions[s.dof.anchor]
+                print(f"           {s.name}: anchor {s.dof.anchor} "
+                      f"(CA of res {anchor_seg.stop} at "
+                      f"{ap.x:.2f}, {ap.y:.2f}, {ap.z:.2f})  [metadata only]")
     else:
         max_attempts = max(args.n_placements * args.max_attempts_factor,
                            args.n_placements)
         print(f"Placement: random, target {args.n_placements} placements "
               f"(up to {max_attempts} attempts)")
 
-    # ----- Trajectory helper ---------------------------------------------
-    def run_placement(placed, p_idx: int, placement_spec: Dict[str, Dict[str, float]]) -> int:
-        """Run n_traj MC trajectories on `placed`, append to `records`, write
-        kept structures, return count kept."""
-        n_kept = 0
-        for t_idx in range(args.n_traj):
-            start = placed.clone()
-            for s_idx, pose in enumerate(mc_torsion_sampling(
-                    start, cfg, sfxn, closers, packer, rng,
-                    trials=args.trials,
-                    temperature=args.temperature,
-                    sigma=args.sigma,
-                    n_perturb=args.n_perturb,
-                    boltzmann_n=args.boltzmann_n,
-                    burnin=burnin)):
-                keep, m = passes_filters(pose, cfg, sfxn)
-                tag = (f"model_{p_idx:03d}_{t_idx:03d}_{s_idx:04d}"
-                       if args.boltzmann_n else f"model_{p_idx:03d}_{t_idx:03d}")
-
-                rec = {"tag": tag, "placement": p_idx, "traj": t_idx,
-                       "snapshot": s_idx, "kept": keep, **m}
-                for name, params in placement_spec.items():
-                    rec.update({f"{name}_{k}": round(float(v), 3)
-                                for k, v in params.items()})
-                records.append(rec)
-
-                if keep:
-                    if writer is not None:
-                        # Everything numeric in the record becomes a SCORE:
-                        # column, so metrics and placement DOF live inside the
-                        # silent file alongside the coordinates.
-                        energies = {k: float(v) for k, v in rec.items()
-                                    if k != "tag" and isinstance(v, (int, float, bool))}
-                        writer.add(pose, tag, energies)
-                    else:
-                        pose.dump_pdb(str(outdir / f"{tag}.pdb"))
-                    n_kept += 1
-        return n_kept
-
     records: List[dict] = []
     placement_records: List[dict] = []
     n_written = 0
-
-    def record_placement(p_idx: int, spec: Dict[str, Dict[str, float]],
-                         viable: bool, gap_note: str = "") -> None:
-        prec = {"placement": p_idx, "viable": bool(viable),
-                "n_traj_run": args.n_traj if viable else 0}
-        for name, params in spec.items():
-            prec.update({f"{name}_{k}": round(float(v), 3)
-                         for k, v in params.items()})
-        if gap_note:
-            prec["gap_note"] = gap_note
-        placement_records.append(prec)
 
     # Compact per-placement log: show the DOF keys that are non-zero for at
     # least one placement in this run (grid axes always qualify; fixed
@@ -1188,29 +1410,99 @@ def main():
             parts.append(" ".join(f"{k}={params[k]:+.2f}" for k in log_keys[name]
                                   if k in params))
         head = f"[placement {p_idx:>4d}/{total}]"
-        print(f"{head} {' | '.join(parts)}  {body}")
+        print(f"{head} {' | '.join(parts)}  {body}", flush=True)
 
     # ----- Main loop -----------------------------------------------------
+    failed_cells: List[int] = []
+    merge_ok = True
     if placement_mode == "grid":
         total = len(grid_placements)
+
+        # Viability is cheap geometry, so the parent screens every cell and
+        # only viable ones are dispatched. This also fixes which cell runs
+        # the silent round-trip check (the first viable one) up front.
+        viable_cells = []
         for p_idx, spec in enumerate(grid_placements):
             placed = reference.clone()
             apply_placement(placed, cfg, jumps, spec, anchor_positions)
-
-            viable = placement_is_viable(placed, cfg, args.span_slack)
-            if not viable:
+            if not placement_is_viable(placed, cfg, args.span_slack):
                 gaps = "; ".join(f"{s.name} gap {loop_gap(placed, s):.1f}A"
                                  for s in cfg.flexible)
-                record_placement(p_idx, spec, viable=False, gap_note=gaps)
-                log_placement(p_idx, total, spec,
-                              f"not viable ({gaps})")
+                placement_records.append(make_placement_record(
+                    args, p_idx, spec, viable=False, gap_note=gaps))
+                log_placement(p_idx, total, spec, f"not viable ({gaps})")
                 continue
+            viable_cells.append((p_idx, spec))
 
-            record_placement(p_idx, spec, viable=True)
-            n_kept = run_placement(placed, p_idx, spec)
-            n_written += n_kept
-            log_placement(p_idx, total, spec,
-                          f"{args.n_traj} trajectories, {n_kept} structures")
+        tasks = [(p_idx, spec, i == 0) for i, (p_idx, spec) in enumerate(viable_cells)]
+        specs = dict(viable_cells)
+        n_workers = min(args.cores, len(tasks))
+        print(f"Running  : {len(tasks)} viable cells "
+              f"on {max(n_workers, 1)} process(es)", flush=True)
+
+        pool = None
+        if n_workers > 1:
+            # spawn, not fork: each worker starts clean and runs its own
+            # pyrosetta.init, instead of inheriting Rosetta's global state.
+            mp = multiprocessing.get_context("spawn")
+            pool = mp.Pool(n_workers, initializer=_worker_init, initargs=(args,))
+            results = pool.imap_unordered(_worker_run_cell, tasks, chunksize=1)
+        else:
+            results = (_safe_run_cell(ctx, t) for t in tasks)
+
+        part_files: List[Path] = []
+        done = 0
+        try:
+            for res in results:
+                done += 1
+                p_idx = res["p_idx"]
+                spec = specs[p_idx]
+                progress = f"[{done}/{len(tasks)} done]"
+                seed_info = {"seed": cell_seed(args.seed, p_idx)}
+                if res["error"]:
+                    failed_cells.append(p_idx)
+                    last = res["error"].strip().splitlines()[-1]
+                    placement_records.append(make_placement_record(
+                        args, p_idx, spec, viable=True, n_traj_run=0,
+                        extra={**seed_info, "error": last}))
+                    log_placement(p_idx, total, spec, f"FAILED: {last}  {progress}")
+                    print(res["error"], flush=True)
+                    continue
+                placement_records.append(make_placement_record(
+                    args, p_idx, spec, viable=True, extra=seed_info))
+                records.extend(res["records"])
+                n_written += res["n_kept"]
+                if res["part"]:
+                    part_files.append(Path(res["part"]))
+                log_placement(p_idx, total, spec,
+                              f"{args.n_traj} trajectories, {res['n_kept']} "
+                              f"structures  {progress}")
+        except BaseException:
+            if pool is not None:
+                pool.terminate()
+                pool.join()
+            raise
+        else:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+        # ----- Merge per-cell silent files -------------------------------
+        if args.silent:
+            part_files.sort()            # p00000.out, p00001.out, ... = serial order
+            n_merged, consistent = (merge_silent_parts(part_files, silent_path)
+                                    if part_files else (0, True))
+            merge_ok = consistent and n_merged == n_written
+            if not consistent:
+                print("WARNING: per-cell silent files have different SCORE "
+                      "columns; the merged SCORE table may be misaligned.")
+            if n_merged != n_written:
+                print(f"WARNING: merged {n_merged} structures but workers "
+                      f"reported {n_written}.")
+            if not merge_ok or args.keep_parts:
+                print(f"Parts kept in {parts_dir}/")
+            else:
+                shutil.rmtree(parts_dir)
     else:
         kept_placements = 0
         attempts = 0
@@ -1224,15 +1516,22 @@ def main():
                 continue
 
             p_idx = kept_placements
-            record_placement(p_idx, spec, viable=True)
-            n_kept = run_placement(placed, p_idx, spec)
+            placement_records.append(make_placement_record(
+                args, p_idx, spec, viable=True))
+            cell_records, n_kept = run_trajectories(ctx, placed, p_idx, spec,
+                                                    rng, writer)
+            records.extend(cell_records)
             n_written += n_kept
             kept_placements += 1
             log_placement(p_idx, args.n_placements, spec,
                           f"{args.n_traj} trajectories, {n_kept} structures "
                           f"({kept_placements}/{args.n_placements})")
-    end_time = time.perf_counter()
-    print(f"\nTotal time: {end_time - start_time:.2f} seconds")
+
+    # Grid results arrive in completion order; put everything back in
+    # placement order so metrics.json looks the same as a serial run.
+    placement_records.sort(key=lambda r: r["placement"])
+    records.sort(key=lambda r: (r["placement"], r["traj"], r["snapshot"]))
+
     # ----- Write metrics.json -------------------------------------------
     metrics_out: Dict[str, object] = {
         "config": args.config, "pdb": args.pdb, "seed": args.seed,
@@ -1241,19 +1540,25 @@ def main():
         "boltzmann_n": args.boltzmann_n, "burnin": burnin,
         "temperature": args.temperature, "trials": args.trials,
         "n_traj": args.n_traj,
+        "cores": args.cores,
         "placement_count": len(placement_records),
         "placements": placement_records,
         "models": records,
     }
     if placement_mode == "grid":
+        metrics_out["rng"] = "per_placement"
+        metrics_out["failed_placements"] = sorted(failed_cells)
         metrics_out["grid"] = {
             s.name: {
                 "anchor": s.dof.anchor,
-                "anchor_position": {
-                    "x": float(anchor_positions[s.dof.anchor].x),
-                    "y": float(anchor_positions[s.dof.anchor].y),
-                    "z": float(anchor_positions[s.dof.anchor].z),
-                },
+                "anchor_position": (
+                    {
+                        "x": float(anchor_positions[s.dof.anchor].x),
+                        "y": float(anchor_positions[s.dof.anchor].y),
+                        "z": float(anchor_positions[s.dof.anchor].z),
+                    }
+                    if s.dof.anchor else None
+                ),
                 "axes": [
                     {"axis": ax, "min": mn, "max": mx, "step": st,
                      "values": _axis_values(mn, mx, st)}
@@ -1267,12 +1572,13 @@ def main():
             for s in mobiles if s.dof.grid_axes
         }
     else:
+        metrics_out["rng"] = "shared"
         metrics_out["placement_attempts"] = attempts
 
     with open(outdir / "metrics.json", "w") as fh:
         json.dump(metrics_out, fh, indent=2)
 
-    if writer is not None:
+    if args.silent:
         print(f"\nDone. {n_written} structures written to {silent_path}")
         print(f"      scores : grep '^SCORE:' {silent_path}")
         print(f"      extract: extract_pdbs -in:file:silent {silent_path} "
@@ -1284,6 +1590,12 @@ def main():
         print("Hit the placement attempt limit: the dof limits are probably "
               "pushing the loops past what they can span. Reduce the "
               "translation maxima, or check the reach budget above.")
+
+    if failed_cells:
+        print(f"\n{len(failed_cells)} placement(s) failed: {sorted(failed_cells)}. "
+              "They are in metrics.json with n_traj_run = 0 and an 'error' field.")
+    if failed_cells or not merge_ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
