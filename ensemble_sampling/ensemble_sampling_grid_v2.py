@@ -27,9 +27,9 @@ Stages
              Translations are lab-frame deltas from the input pose.
      grid    Iterate the Cartesian product of the declared grid axes; run
              every cell once and record non-viable cells with zero
-             trajectories. Translations are lab-frame displacements from the
-             input pose (signed; z: 0 = in place, z: negative = moved down).
-             An `anchor` may be named; it is recorded as metadata only.
+             trajectories. Translations are absolute positions of the moved
+             segment's N-terminal CA, expressed relative to the C-terminal CA
+             of an `anchor` rigid segment (signed z: negative = below anchor).
 4. For each placement, run Monte Carlo torsion sampling over the flexible
    segments (perturb -> close -> repack -> Metropolis), analogous to the
    SetTorsion + PackRotamers + GenericMonteCarlo block in symm_torsions.xml.
@@ -156,10 +156,10 @@ class DOF:
     Grid mode: any of {x, y, z, tilt, spin} may be given as a scalar (fixed
     value) or as a dict {min, max, step} (grid axis). The Cartesian product
     of the grid axes is enumerated, with scalars held constant. The (x, y, z)
-    values are lab-frame displacements of the segment from the input pose --
-    signed, so z: 0 leaves it in place and z: -15 moves it 15 A down. Tilt
-    and spin keep their perturbation-from-input semantics. `anchor`, if given,
-    is recorded as metadata only (grid-frame origin in metrics.json).
+    values are absolute positions of the moved segment's N-terminal CA,
+    expressed relative to the C-terminal CA of `anchor` -- signed, so
+    z: -15 means "attachment atom 15 A below the anchor". Tilt and spin
+    keep their perturbation-from-input semantics.
     """
     mode: str = "random"
     anchor: Optional[str] = None
@@ -562,9 +562,10 @@ def _axis_values(mn: float, mx: float, step: float) -> List[float]:
 def anchor_position(pose, cfg: Construct, anchor_name: str):
     """CA of the C-terminal residue of the named rigid segment.
 
-    Recorded in metrics.json as the grid-frame origin for any mobile segment
-    that names it as `anchor`. It is metadata only: translations are lab-frame
-    displacements from the input pose and do not reference this point.
+    This is the origin of the grid coordinate frame for any mobile segment
+    that names it as `anchor`: (dx, dy, dz) = (0, 0, 0) means "attachment CA
+    sits exactly at this atom", and z is a signed lab-frame offset from it
+    (negative -> below, in the F3/TM case that means towards the membrane).
     """
     for s in cfg.rigid:
         if s.name == anchor_name:
@@ -608,7 +609,7 @@ def enumerate_grid_placements(mobiles: List[Segment]):
     fixed. Iteration order is a Cartesian product across all axes of all
     mobile segments, in declaration order (last axis varies fastest).
 
-    For grid segments (dx, dy, dz) are displacements (see apply_placement).
+    For grid segments (dx, dy, dz) are absolute coords (see apply_placement).
     Tilt/spin keep their perturbation semantics. `tilt_azimuth` is deterministic
     at 0.0 in grid mode -- if you later grid tilt itself, decide whether to
     also grid the azimuth or just pick a fixed direction and record that here.
@@ -645,10 +646,11 @@ def apply_placement(pose, cfg: Construct, jumps: Dict[str, int],
     """Apply a placement to the mobile rigid segments, in place.
 
     Order per segment: spin (about own axis) -> tilt (about a perpendicular)
-    -> translate. In both modes translations are lab-frame deltas from the
-    input pose: (dx, dy, dz) displace the segment as-is, so dz=0 leaves it
-    where it was. Grid mode's `anchor` is kept only as recorded metadata
-    (the grid-frame origin in metrics.json) and does not enter the move.
+    -> translate. Random-mode translations are lab-frame deltas from the
+    input pose. Grid-mode translations move the segment's N-terminal CA to
+    an absolute target: anchor_position + (dx, dy, dz), where dz is signed.
+    Because tilt/spin rotate the attachment CA off its input location, the
+    translation for grid mode is measured *after* the rotations are applied.
     """
     block_of = {r.name: (lo, hi) for r, lo, hi in cfg.blocks()}
 
@@ -666,11 +668,14 @@ def apply_placement(pose, cfg: Construct, jumps: Dict[str, int],
             tilt_axis = perpendicular_to(own_axis, params.get("tilt_azimuth", 0.0))
             rotate_jump(pose, jid, tilt_axis, params["tilt"], centre)
 
-        # Both modes treat (dx, dy, dz) as lab-frame displacements from the
-        # input pose: dz=0 leaves the segment where it is. Grid mode's anchor
-        # is retained only as recorded metadata (grid-frame origin in
-        # metrics.json); it no longer enters the translation.
-        tx, ty, tz = params["dx"], params["dy"], params["dz"]
+        if seg.dof.mode == "grid":
+            ap = anchor_positions[seg.dof.anchor]
+            current = ca_xyz(pose, seg.start)
+            tx = ap.x + params["dx"] - current.x
+            ty = ap.y + params["dy"] - current.y
+            tz = ap.z + params["dz"] - current.z
+        else:
+            tx, ty, tz = params["dx"], params["dy"], params["dz"]
 
         dist = math.sqrt(tx * tx + ty * ty + tz * tz)
         if dist > 1e-9:
@@ -1289,7 +1294,56 @@ def parse_args():
     p.add_argument("--keep-parts", action="store_true",
                    help="Grid mode: keep the per-cell silent files in "
                         f"<out>/{PARTS_DIRNAME}/ after a successful merge")
+
+    g = p.add_argument_group(
+        "grid sharding",
+        "Split one grid across independent runs (e.g. SLURM array tasks on "
+        "separate nodes). Shards are disjoint contiguous windows of the same "
+        "cell enumeration, so no two shards ever run the same cell and the "
+        "union of all shards is the whole grid. Cell indices, per-cell seeds "
+        "and structure tags are global, so a sharded campaign yields exactly "
+        "the same ensemble as one unsharded run.")
+    g.add_argument("--n-shards", type=int, default=1,
+                   help="Split the grid into this many equal-sized shards.")
+    g.add_argument("--shard", type=int, default=0,
+                   help="Which shard this run executes (0-based). Set from "
+                        "$SLURM_ARRAY_TASK_ID.")
+    g.add_argument("--cell-start", type=int, default=None,
+                   help="Explicit lower bound (inclusive) of the global cell "
+                        "index window. Overrides --shard/--n-shards.")
+    g.add_argument("--cell-stop", type=int, default=None,
+                   help="Explicit upper bound (exclusive) of the global cell "
+                        "index window. Overrides --shard/--n-shards.")
     return p.parse_args()
+
+
+def shard_window(n_cells: int, args: argparse.Namespace) -> Tuple[int, int]:
+    """Resolve this run's [start, stop) window into the global cell list.
+
+    Explicit --cell-start/--cell-stop win if either is given. Otherwise the
+    grid is cut into --n-shards contiguous windows; the first
+    (n_cells % n_shards) shards take one extra cell, so the windows tile the
+    grid exactly with no gap, no overlap and a size spread of at most one.
+    """
+    if args.cell_start is not None or args.cell_stop is not None:
+        start = 0 if args.cell_start is None else args.cell_start
+        stop = n_cells if args.cell_stop is None else args.cell_stop
+        if not 0 <= start <= stop <= n_cells:
+            raise SystemExit(
+                f"--cell-start/--cell-stop [{start}, {stop}) is not inside "
+                f"[0, {n_cells}) for this grid.")
+        return start, stop
+
+    if args.n_shards < 1:
+        raise SystemExit("--n-shards must be >= 1")
+    if not 0 <= args.shard < args.n_shards:
+        raise SystemExit(
+            f"--shard must be in [0, {args.n_shards}), got {args.shard}")
+
+    base, rem = divmod(n_cells, args.n_shards)
+    start = args.shard * base + min(args.shard, rem)
+    stop = start + base + (1 if args.shard < rem else 0)
+    return start, stop
 
 
 def main():
@@ -1310,6 +1364,14 @@ def main():
 
     if placement_mode != "grid" and args.cores > 1:
         raise SystemExit("--cores > 1 is only supported in grid mode.")
+
+    sharded = (args.n_shards > 1 or args.cell_start is not None
+               or args.cell_stop is not None)
+    if placement_mode != "grid" and sharded:
+        raise SystemExit(
+            "--n-shards/--cell-start/--cell-stop are only supported in grid "
+            "mode. Random mode has no fixed cell enumeration to partition; "
+            "give each run a different --seed instead.")
 
     print("Rigid    : " + ", ".join(
         f"{s.name} {s.start}-{s.stop}"
@@ -1358,7 +1420,22 @@ def main():
     # ----- Placement setup -----------------------------------------------
     if placement_mode == "grid":
         grid_placements = list(enumerate_grid_placements(mobiles))
-        print(f"Placement: grid, {len(grid_placements)} cells")
+        n_cells_total = len(grid_placements)
+        cell_start, cell_stop = shard_window(n_cells_total, args)
+        # Keep the GLOBAL index as p_idx: it drives cell_seed(), the model
+        # tags and the metrics records, so a cell behaves identically no
+        # matter which shard happens to run it.
+        shard_cells = list(enumerate(grid_placements))[cell_start:cell_stop]
+        print(f"Placement: grid, {n_cells_total} cells")
+        if sharded:
+            print(f"Shard    : {args.shard + 1}/{args.n_shards} -> global "
+                  f"cells [{cell_start}, {cell_stop}) = {len(shard_cells)} "
+                  f"cells on this node")
+        if not shard_cells:
+            raise SystemExit(
+                f"This shard's window [{cell_start}, {cell_stop}) is empty "
+                f"({n_cells_total} cells over {args.n_shards} shards). "
+                "Use fewer shards than cells.")
         for s in mobiles:
             if not s.dof.grid_axes:
                 continue
@@ -1370,15 +1447,14 @@ def main():
                     ("x", s.dof.tx), ("y", s.dof.ty), ("z", s.dof.tz),
                     ("tilt", s.dof.tilt), ("spin", s.dof.spin)]
                 if k not in s.dof.grid_axes)
+            anchor_seg = next(x for x in cfg.rigid if x.name == s.dof.anchor)
+            ap = anchor_positions[s.dof.anchor]
             print(f"           {s.name}: axes {axes_desc}")
             if fixed_desc:
                 print(f"           {s.name}: fixed {fixed_desc}")
-            if s.dof.anchor:
-                anchor_seg = next(x for x in cfg.rigid if x.name == s.dof.anchor)
-                ap = anchor_positions[s.dof.anchor]
-                print(f"           {s.name}: anchor {s.dof.anchor} "
-                      f"(CA of res {anchor_seg.stop} at "
-                      f"{ap.x:.2f}, {ap.y:.2f}, {ap.z:.2f})  [metadata only]")
+            print(f"           {s.name}: anchor {s.dof.anchor} "
+                  f"(CA of res {anchor_seg.stop} at "
+                  f"{ap.x:.2f}, {ap.y:.2f}, {ap.z:.2f})")
     else:
         max_attempts = max(args.n_placements * args.max_attempts_factor,
                            args.n_placements)
@@ -1416,13 +1492,14 @@ def main():
     failed_cells: List[int] = []
     merge_ok = True
     if placement_mode == "grid":
-        total = len(grid_placements)
+        total = n_cells_total
 
-        # Viability is cheap geometry, so the parent screens every cell and
-        # only viable ones are dispatched. This also fixes which cell runs
-        # the silent round-trip check (the first viable one) up front.
+        # Viability is cheap geometry, so the parent screens every cell in
+        # its own shard and only viable ones are dispatched. This also fixes
+        # which cell runs the silent round-trip check (the first viable one
+        # in this shard) up front.
         viable_cells = []
-        for p_idx, spec in enumerate(grid_placements):
+        for p_idx, spec in shard_cells:
             placed = reference.clone()
             apply_placement(placed, cfg, jumps, spec, anchor_positions)
             if not placement_is_viable(placed, cfg, args.span_slack):
@@ -1548,17 +1625,20 @@ def main():
     if placement_mode == "grid":
         metrics_out["rng"] = "per_placement"
         metrics_out["failed_placements"] = sorted(failed_cells)
+        metrics_out["shard"] = {
+            "index": args.shard, "n_shards": args.n_shards,
+            "cell_start": cell_start, "cell_stop": cell_stop,
+            "n_cells_total": n_cells_total,
+            "n_cells_this_shard": len(shard_cells),
+        }
         metrics_out["grid"] = {
             s.name: {
                 "anchor": s.dof.anchor,
-                "anchor_position": (
-                    {
-                        "x": float(anchor_positions[s.dof.anchor].x),
-                        "y": float(anchor_positions[s.dof.anchor].y),
-                        "z": float(anchor_positions[s.dof.anchor].z),
-                    }
-                    if s.dof.anchor else None
-                ),
+                "anchor_position": {
+                    "x": float(anchor_positions[s.dof.anchor].x),
+                    "y": float(anchor_positions[s.dof.anchor].y),
+                    "z": float(anchor_positions[s.dof.anchor].z),
+                },
                 "axes": [
                     {"axis": ax, "min": mn, "max": mx, "step": st,
                      "values": _axis_values(mn, mx, st)}
